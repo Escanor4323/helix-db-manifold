@@ -169,6 +169,27 @@ pub enum VectorError {
     VectorAlreadyDeleted(String),
 }
 
+#[derive(Debug)]
+pub enum ManifoldError {
+    InvalidPoint(String),
+    DimensionMismatch,
+    NumericalInstability(String),
+    InvalidCurvature(String),
+}
+
+impl std::error::Error for ManifoldError {}
+
+impl fmt::Display for ManifoldError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ManifoldError::InvalidPoint(msg) => write!(f, "Invalid point: {msg}"),
+            ManifoldError::DimensionMismatch => write!(f, "Dimension mismatch"),
+            ManifoldError::NumericalInstability(msg) => write!(f, "Numerical instability: {msg}"),
+            ManifoldError::InvalidCurvature(msg) => write!(f, "Invalid curvature: {msg}"),
+        }
+    }
+}
+
 impl std::error::Error for VectorError {}
 
 impl fmt::Display for VectorError {
