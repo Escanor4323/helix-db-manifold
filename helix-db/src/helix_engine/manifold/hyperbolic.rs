@@ -6,6 +6,7 @@ use crate::helix_engine::types::ManifoldError;
 use super::curvature::{LearnableCurvature, CurvatureSign};
 use super::numerics::{
     EPSILON, safe_arcosh, safe_artanh, safe_div, safe_sqrt,
+    safe_cosh, safe_sinh,
     dot, norm, norm_squared, minkowski_dot, lorentz_norm,
 };
 use super::traits::Manifold;
@@ -97,6 +98,20 @@ impl HyperbolicManifold {
             .map(|(xi, yi)| safe_div(num_x * xi + num_y * yi, denom))
             .collect()
     }
+
+    /// Check if vector v is tangent to the hyperboloid at point x.
+    /// A tangent vector satisfies ⟨v, x⟩_L = 0 within tolerance.
+    /// Only valid for Lorentz model.
+    pub fn is_tangent(&self, x: &[f64], v: &[f64], tol: f64) -> bool {
+        if self.model != HyperbolicModel::Lorentz {
+            return true; // Poincaré has no constraint
+        }
+        if x.len() != self.dim + 1 || v.len() != self.dim + 1 {
+            return false;
+        }
+        let inner = minkowski_dot(v, x);
+        inner.abs() < tol
+    }
 }
 
 impl Manifold for HyperbolicManifold {
@@ -172,10 +187,12 @@ impl Manifold for HyperbolicManifold {
                 if v_norm < EPSILON {
                     return Ok(x.to_vec());
                 }
-                let cosh_v = v_norm.cosh();
-                let sinh_v = v_norm.sinh();
+                // Use safe_cosh/safe_sinh to prevent overflow in deep networks
+                let cosh_v = safe_cosh(v_norm);
+                let sinh_v = safe_sinh(v_norm);
+                let scale = safe_div(sinh_v, v_norm);
                 Ok(x.iter().zip(v.iter())
-                    .map(|(xi, vi)| cosh_v * xi + sinh_v * vi / v_norm)
+                    .map(|(xi, vi)| cosh_v * xi + scale * vi)
                     .collect())
             }
             HyperbolicModel::Poincare => {
@@ -208,11 +225,14 @@ impl Manifold for HyperbolicManifold {
                     return Ok(vec![0.0; self.dim + 1]);
                 }
                 let inner = minkowski_dot(x, y);
+                // Correct direction: y - κ⟨x,y⟩_L x lies in tangent space at x
                 let direction: Vec<f64> = y.iter().zip(x.iter())
-                    .map(|(yi, xi)| yi + kappa * inner * xi)
+                    .map(|(yi, xi)| yi - kappa * inner * xi)
                     .collect();
                 let dir_norm = lorentz_norm(&direction);
-                Ok(direction.iter().map(|di| d * di / dir_norm).collect())
+                // Use safe_div to prevent division by zero in extreme cases
+                let scale = safe_div(d, dir_norm);
+                Ok(direction.iter().map(|di| scale * di).collect())
             }
             HyperbolicModel::Poincare => {
                 if x.len() != self.dim || y.len() != self.dim {
@@ -270,8 +290,10 @@ impl Manifold for HyperbolicManifold {
                     return Err(ManifoldError::DimensionMismatch);
                 }
                 let inner = minkowski_dot(v, x);
+                // Correct formula: v - κ⟨v,x⟩_L x gives ⟨proj,x⟩_L = 0
+                // Note: spec says + but that's incorrect for the hyperboloid constraint
                 Ok(v.iter().zip(x.iter())
-                    .map(|(vi, xi)| vi + kappa * inner * xi)
+                    .map(|(vi, xi)| vi - kappa * inner * xi)
                     .collect())
             }
             HyperbolicModel::Poincare => {
@@ -389,4 +411,131 @@ mod tests {
             assert!((a - b).abs() < 1e-8);
         }
     }
+
+    // === Issue #2: Fuzz tests with extreme values ===
+
+    #[test]
+    fn test_lorentz_exp_map_extreme_tangent_norm() {
+        let m = HyperbolicManifold::new(3);
+        let origin = m.origin();
+        
+        // Very large tangent vector (should not overflow)
+        let huge_v = vec![0.0, 1e10, 1e10, 1e10];
+        let result = m.exp_map(&origin, &huge_v);
+        assert!(result.is_ok());
+        let point = result.unwrap();
+        for val in &point {
+            assert!(!val.is_nan(), "NaN detected in exp_map with huge tangent");
+            assert!(val.is_finite(), "Infinity detected in exp_map with huge tangent");
+        }
+        
+        // Very tiny tangent vector
+        let tiny_v = vec![0.0, 1e-15, 1e-15, 1e-15];
+        let result = m.exp_map(&origin, &tiny_v);
+        assert!(result.is_ok());
+        let point = result.unwrap();
+        for val in &point {
+            assert!(!val.is_nan(), "NaN detected in exp_map with tiny tangent");
+        }
+    }
+
+    #[test]
+    fn test_lorentz_log_map_no_nan() {
+        let m = HyperbolicManifold::new(3);
+        let origin = m.origin();
+        
+        // Create a point on the manifold via projection
+        let raw = vec![2.0, 0.5, 0.3, 0.1];
+        let point = m.project(&raw).unwrap();
+        
+        let result = m.log_map(&origin, &point);
+        assert!(result.is_ok());
+        let tangent = result.unwrap();
+        for val in &tangent {
+            assert!(!val.is_nan(), "NaN detected in log_map");
+            assert!(val.is_finite(), "Infinity detected in log_map");
+        }
+    }
+
+    #[test]
+    fn test_lorentz_distance_no_nan() {
+        let m = HyperbolicManifold::new(3);
+        let origin = m.origin();
+        
+        // Same point distance
+        let d = m.distance(&origin, &origin).unwrap();
+        assert!(!d.is_nan());
+        assert!(d >= 0.0);
+        
+        // Distant points
+        let raw = vec![10.0, 5.0, 3.0, 1.0];
+        let point = m.project(&raw).unwrap();
+        let d = m.distance(&origin, &point).unwrap();
+        assert!(!d.is_nan());
+        assert!(d.is_finite());
+        assert!(d > 0.0);
+    }
+
+    // === Issue #2: Constraint test for proj ===
+
+    #[test]
+    fn test_tangent_projection_constraint() {
+        let m = HyperbolicManifold::new(3);
+        let origin = m.origin();
+        
+        // Arbitrary vector (not necessarily tangent)
+        let v = vec![1.0, 2.0, 3.0, 4.0];
+        let projected = m.project_tangent(&origin, &v).unwrap();
+        
+        // Calculate inner product for debugging
+        let inner = minkowski_dot(&projected, &origin);
+        
+        // Use looser tolerance for floating-point operations
+        assert!(inner.abs() < 1e-5,
+            "Tangent projection failed: inner product = {}, expected ≈ 0", inner);
+    }
+
+    #[test]
+    fn test_is_tangent_validation() {
+        let m = HyperbolicManifold::new(2);
+        let origin = m.origin(); // [1, 0, 0] for κ=-1
+        
+        // Valid tangent: spatial components only
+        let valid_tangent = vec![0.0, 1.0, 0.0];
+        assert!(m.is_tangent(&origin, &valid_tangent, 1e-10));
+        
+        // Invalid tangent: has time component
+        let invalid_tangent = vec![1.0, 0.0, 0.0];
+        assert!(!m.is_tangent(&origin, &invalid_tangent, 1e-10));
+    }
+
+    // === Issue #2: Stress test ensuring no panics ===
+
+    #[test]
+    fn test_stress_mixed_operations() {
+        let m = HyperbolicManifold::new(5);
+        let origin = m.origin();
+        
+        // Chain of operations  
+        for i in 1..100 {
+            let scale = (i as f64) * 0.1;
+            let v = vec![0.0, scale, scale * 0.5, scale * 0.3, scale * 0.1, scale * 0.05];
+            
+            let point = m.exp_map(&origin, &v).unwrap();
+            let _ = m.distance(&origin, &point).unwrap();
+            let v_back = m.log_map(&origin, &point).unwrap();
+            
+            // Verify no NaN or infinity in results
+            for val in &v_back {
+                assert!(!val.is_nan(), "NaN in log_map at iteration {}", i);
+                assert!(val.is_finite(), "Infinity in log_map at iteration {}", i);
+            }
+            
+            // Verify tangent constraint with appropriate tolerance
+            let inner = minkowski_dot(&v_back, &origin);
+            assert!(inner.abs() < 1e-5,
+                "Log map output not tangent at iteration {}: inner = {}", i, inner);
+        }
+    }
 }
+
