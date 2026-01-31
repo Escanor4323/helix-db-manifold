@@ -15,6 +15,24 @@ pub fn safe_arcosh(x: f64) -> f64 {
     (x.max(1.0 + EPSILON)).acosh()
 }
 
+/// Maximum safe argument for cosh/sinh to avoid overflow.
+/// sinh(88) ≈ 8e37, safe for f64 representation.
+pub const MAX_HYPERBOLIC_ARG: f64 = 88.0;
+
+/// Safe cosh with overflow protection.
+/// Clamps input to prevent f64 overflow in Lorentz exp_map.
+#[inline]
+pub fn safe_cosh(x: f64) -> f64 {
+    x.clamp(-MAX_HYPERBOLIC_ARG, MAX_HYPERBOLIC_ARG).cosh()
+}
+
+/// Safe sinh with overflow protection.
+/// Clamps input to prevent f64 overflow in Lorentz exp_map.
+#[inline]
+pub fn safe_sinh(x: f64) -> f64 {
+    x.clamp(-MAX_HYPERBOLIC_ARG, MAX_HYPERBOLIC_ARG).sinh()
+}
+
 /// Safe artanh that clamps input to (-1, 1) range.
 /// artanh(x) is only defined for |x| < 1.
 #[inline]
@@ -126,5 +144,46 @@ mod tests {
         let x = vec![2.0, 1.0, 0.0];
         let y = vec![2.0, 1.0, 0.0];
         assert!((minkowski_dot(&x, &y) - (-3.0)).abs() < EPSILON);
+    }
+
+    #[test]
+    fn test_safe_cosh_no_overflow() {
+        // Normal values
+        assert!(!safe_cosh(0.0).is_nan());
+        assert!(!safe_cosh(10.0).is_nan());
+        assert!(!safe_cosh(-10.0).is_nan());
+        
+        // Extreme values that would overflow without clamping
+        assert!(!safe_cosh(1e100).is_nan());
+        assert!(!safe_cosh(-1e100).is_nan());
+        assert!(safe_cosh(1e100).is_finite());
+        assert!(safe_cosh(-1e100).is_finite());
+    }
+
+    #[test]
+    fn test_safe_sinh_no_overflow() {
+        // Normal values
+        assert!(!safe_sinh(0.0).is_nan());
+        assert!(!safe_sinh(10.0).is_nan());
+        assert!(!safe_sinh(-10.0).is_nan());
+        
+        // Extreme values that would overflow without clamping
+        assert!(!safe_sinh(1e100).is_nan());
+        assert!(!safe_sinh(-1e100).is_nan());
+        assert!(safe_sinh(1e100).is_finite());
+        assert!(safe_sinh(-1e100).is_finite());
+    }
+
+    #[test]
+    fn test_safe_div_extreme_values() {
+        // Tiny denominator
+        assert!(safe_div(1.0, 1e-20).is_finite());
+        assert!(safe_div(1.0, -1e-20).is_finite());
+        
+        // Zero denominator
+        assert!(safe_div(1.0, 0.0).is_finite());
+        
+        // Huge values
+        assert!(safe_div(1e100, 1e100).is_finite());
     }
 }
